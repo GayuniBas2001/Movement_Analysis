@@ -61,7 +61,7 @@ def evaluate_bicep_curl(angles: dict) -> tuple:
 
     # Calculate form score
     form_score = good_form_count / total_checks
-    is_good_form = form_score >= 0.67  # At least 2/3 criteria must be good
+    is_good_form = form_score >= 0.65  # At least 2/3 criteria must be good
 
     # --- Final verdict ---
     if form_score == 1.0:

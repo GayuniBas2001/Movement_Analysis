@@ -214,9 +214,9 @@ try:
                 "hip_angle": hip_angle
             })
             
-            # Count reps based on elbow angle and form
-            rep_counted, current_phase, total_reps = rep_counter.evaluate_rep(
-                elbow_angle, is_good_form
+            # Count reps based on elbow angle, wrist movement, and form
+            rep_counted, current_phase, total_reps, transition_state, is_form_good_global = rep_counter.evaluate_rep(
+                elbow_angle, right_wrist[1], is_good_form  # Pass wrist Y coordinate
             )
             
             # Show rep count notification if a rep was just counted
@@ -235,6 +235,8 @@ try:
             form_score = 0.0
             is_good_form = False
             total_reps = rep_counter.rep_count
+            transition_state = rep_counter.transition_state
+            is_form_good_global = rep_counter.is_form_good_global
 
         # Draw landmarks on both color and depth frames
         annotated_frame = draw_landmarks_on_image(rgb_frame, detection_result)
@@ -286,6 +288,12 @@ try:
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 100), 2)
             cv2.putText(feedback_panel, f"Form Score: {form_score:.1%}", (10, 85),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 150, 0) if is_good_form else (0, 0, 150), 2)
+            
+            # Add movement form status
+            form_status = rep_counter.get_form_status()
+            form_color = (0, 150, 0) if form_status == "CORRECT" else (0, 0, 200)
+            cv2.putText(feedback_panel, f"Movement: {form_status}", (10, 110),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, form_color, 2)
             
             # Middle section: 3D Analysis
             middle_x = panel_width // 3

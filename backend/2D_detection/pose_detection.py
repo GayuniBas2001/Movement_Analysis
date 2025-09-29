@@ -7,6 +7,11 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import urllib.request
 import os
+import sys
+import os
+# Add the parent directory to the path so we can import from backend
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from angle_utils import calculate_angle  # Import the angle calculation function
 from pose_evaluation import evaluate_bicep_curl  # Import the evaluation function
 from rep_counter import BicepCurlCounter  # Import the rep counter
@@ -128,9 +133,12 @@ try:
                 "hip_angle": hip_angle
             })
             
-            # Count reps based on elbow angle and form
-            rep_counted, current_phase, total_reps = rep_counter.evaluate_rep(
-                elbow_angle, is_good_form
+            # Convert wrist coordinates to pixel Y coordinate for movement tracking
+            wrist_y_pixel = int(landmarks[16].y * display_frame.shape[0])
+            
+            # Count reps based on elbow angle, wrist movement, and form
+            rep_counted, current_phase, total_reps, transition_state, is_form_good_global = rep_counter.evaluate_rep(
+                elbow_angle, wrist_y_pixel, is_good_form
             )
             
             # Show rep count notification if a rep was just counted
@@ -145,11 +153,17 @@ try:
             cv2.putText(feedback_panel, f"Form Score: {form_score:.1%}", (10, 85),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 150, 0) if is_good_form else (0, 0, 150), 2)
             
+            # Add movement form status
+            form_status = rep_counter.get_form_status()
+            form_color = (0, 150, 0) if form_status == "CORRECT" else (0, 0, 200)
+            cv2.putText(feedback_panel, f"Movement: {form_status}", (10, 110),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, form_color, 2)
+            
             # Add separator line
-            cv2.line(feedback_panel, (10, 95), (panel_width-10, 95), (200, 200, 200), 1)
+            cv2.line(feedback_panel, (10, 120), (panel_width-10, 120), (200, 200, 200), 1)
 
             # Write feedback text on the panel - each line properly spaced
-            y_start = 110  # Starting Y position after rep info
+            y_start = 135  # Starting Y position after rep info
             line_height = 25  # Height between lines for better readability
             
             for i, line in enumerate(feedback.split("\n")):
@@ -158,7 +172,12 @@ try:
                     cv2.putText(feedback_panel, line.strip(), (10, y_position),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
         else:
-            # When no pose detected, show "No person detected" message
+            # When no pose detected, set default values
+            total_reps = rep_counter.rep_count
+            transition_state = rep_counter.transition_state
+            is_form_good_global = rep_counter.is_form_good_global
+            
+            # Show "No person detected" message
             cv2.putText(feedback_panel, "No Person Detected", (10, 100),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 100, 100), 2)
             cv2.putText(feedback_panel, "Please step into view", (10, 140),

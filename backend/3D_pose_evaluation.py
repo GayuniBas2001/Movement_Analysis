@@ -1,17 +1,23 @@
-import cv2
-import numpy as np
-import mediapipe as mp
-from mediapipe import solutions
-from mediapipe.framework.formats import landmark_pb2
+import cv2                    # OpenCV - Computer vision library
+import numpy as np           # NumPy - Numerical computations
+import mediapipe as mp       # Google's ML framework for pose detection
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import urllib.request
 import os
-import pyrealsense2 as rs
+import pyrealsense2 as rs    # Intel RealSense SDK for depth cameras
 
+from rgbd_set_up import (
+    configure_depth_sensor, 
+    calculate_depth_quality, 
+    get_center_distance,
+    draw_landmarks_on_image,
+    user_interface_for_preset_selection
+)
 from angle_utils import calculate_angle
-from pose_evaluation import evaluate_bicep_curl
-from rep_counter import BicepCurlCounter
+from exercise_selector import select_exercise
+from rep_counter import BicepCurlCounter, ArmRaiseCounter
+from landmark_utils import get_3d_landmark, get_multiple_3d_landmarks, get_true_3d_landmark, get_camera_intrinsics
 
 #############################################################
 # DEPTH CONFIGURATION
@@ -22,34 +28,6 @@ DEPTH_PRESETS = {
     "bright_light": {"name": "☀️ Bright Light/Outdoors", "laser_power": 360, "receiver_gain": 16, "auto_exposure_priority": 0, "holes_fill": 5},
     "close_up": {"name": "🔍 Close Range (<1m)", "laser_power": 100, "receiver_gain": 16, "auto_exposure_priority": 0, "holes_fill": 5}
 }
-
-def configure_depth_sensor(depth_sensor, preset_name):
-    """Apply preset configuration to depth sensor"""
-    preset = DEPTH_PRESETS[preset_name]
-    try:
-        depth_sensor.set_option(rs.option.laser_power, preset["laser_power"])
-        depth_sensor.set_option(rs.option.receiver_gain, preset["receiver_gain"])
-        depth_sensor.set_option(rs.option.auto_exposure_priority, preset["auto_exposure_priority"])
-        depth_sensor.set_option(rs.option.holes_fill, preset["holes_fill"])
-        print(f"Applied preset: {preset['name']}")
-        return True
-    except Exception as e:
-        print(f"Error applying preset: {e}")
-        return False
-    
-def calculate_depth_quality(depth_frame):
-    """Calculate the percentage of valid depth pixels"""
-    depth_image = np.asanyarray(depth_frame.get_data())
-    valid_pixels = np.sum(depth_image > 0)
-    total_pixels = depth_image.size
-    validity_ratio = valid_pixels / total_pixels
-    return validity_ratio
-
-def get_center_distance(depth_frame):
-    """Get distance in meters at the center of the frame"""
-    height, width = depth_frame.get_height(), depth_frame.get_width()
-    center_x, center_y = width // 2, height // 2
-    return depth_frame.get_distance(center_x, center_y)
 
 #############################################################
 # MEDIAPIPE POSE LANDMARKER
@@ -64,23 +42,17 @@ base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
 options = vision.PoseLandmarkerOptions(base_options=base_options, output_segmentation_masks=True)
 detector = vision.PoseLandmarker.create_from_options(options)
 
-rep_counter = BicepCurlCounter()
+selected_exercise_name, selected_exercise_func = select_exercise()
 
-def draw_landmarks_on_image(image, detection_result):
-    pose_landmarks_list = detection_result.pose_landmarks
-    annotated_image = np.copy(image)
-    for pose_landmarks in pose_landmarks_list:
-        pose_landmarks_proto = landmark_pb2.NormalizedLandmarkList()
-        pose_landmarks_proto.landmark.extend([
-            landmark_pb2.NormalizedLandmark(x=lm.x, y=lm.y, z=lm.z) for lm in pose_landmarks
-        ])
-        solutions.drawing_utils.draw_landmarks(
-            annotated_image,
-            pose_landmarks_proto,
-            solutions.pose.POSE_CONNECTIONS,
-            solutions.drawing_styles.get_default_pose_landmarks_style()
-        )
-    return annotated_image
+# Select appropriate rep counter based on exercise
+if selected_exercise_name == "Bicep Curl":
+    rep_counter = BicepCurlCounter()
+elif selected_exercise_name == "Arm Raise":
+    rep_counter = ArmRaiseCounter()
+else:
+    # Default to BicepCurlCounter for other exercises (can be expanded later)
+    rep_counter = BicepCurlCounter()
+    print(f"⚠️ Using default BicepCurlCounter for {selected_exercise_name} - may not track reps correctly")
 
 #############################################################
 # REALSENSE PIPELINE
@@ -93,32 +65,20 @@ config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
 profile = pipeline.start(config)
 depth_sensor = profile.get_device().first_depth_sensor()
 
-# User interface for preset selection
-print("🎯 RealSense Depth Camera Configuration")
-print("=" * 50)
-for i, (key, preset) in enumerate(DEPTH_PRESETS.items()):
-    print(f"{i+1}. {preset['name']}")
+# Get camera intrinsics for true 3D coordinate conversion
+camera_intrinsics = get_camera_intrinsics(profile)
+print(f"Camera intrinsics loaded: {camera_intrinsics is not None}")
 
-selected = None
-while selected not in DEPTH_PRESETS.keys():
-    try:
-        choice = int(input("\nSelect a configuration preset (1-4): ")) - 1
-        selected = list(DEPTH_PRESETS.keys())[choice]
-    except (ValueError, IndexError):
-        print("Invalid selection. Please choose 1-4.")
-
-configure_depth_sensor(depth_sensor, selected)
+selected = user_interface_for_preset_selection(DEPTH_PRESETS, depth_sensor)
 
 # Setup frame alignment - align depth to color stream
-align_to = rs.stream.color  # ✅ This is the stream type
-align = rs.align(align_to)  # ✅ This creates the align processor
+align_to = rs.stream.color  # This is the stream type
+align = rs.align(align_to)  # This creates the align processor
 
 # Calibration target distance
 TARGET_DISTANCE = 3.0  # meters
-calibration_mode = input("\nEnable calibration mode? (y/n): ").lower().startswith('y')
 
 print("\nStarting video stream...")
-print("Press '1-4' to change presets")
 print("Press 'q' to quit, 'r' to reset rep counter")
 
 current_gain = DEPTH_PRESETS[selected]["receiver_gain"]
@@ -138,12 +98,11 @@ try:
         if not depth_frame or not color_frame:
             continue
 
-                # Process images
+        # Process images
         color_image = np.asanyarray(color_frame.get_data())
         depth_image = np.asanyarray(depth_frame.get_data())
         depth_colormap = cv2.applyColorMap(cv2.convertScaleAbs(depth_image, alpha=0.03), cv2.COLORMAP_JET)
-        
-    #### ADDED FROM realsense_test.py ####    
+         
         # Get metrics
         center_distance = get_center_distance(depth_frame)
         data_quality = calculate_depth_quality(depth_frame)
@@ -153,7 +112,6 @@ try:
         center_x, center_y = width // 2, height // 2
         cv2.drawMarker(color_image, (center_x, center_y), (0, 255, 0), cv2.MARKER_CROSS, 20, 2)
         cv2.drawMarker(depth_colormap, (center_x, center_y), (0, 255, 0), cv2.MARKER_CROSS, 20, 2)
-    #### ADDED FROM realsense_test.py ####   
 
         frame = np.asanyarray(color_frame.get_data())
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -170,65 +128,30 @@ try:
             depth_h = depth_frame.get_height()
             depth_w = depth_frame.get_width()
 
-            def get_3d_landmark(index):
-                # Convert normalized coordinates to pixel coordinates
-                # Use color frame dimensions for MediaPipe landmark conversion
-                cx_color = int(landmarks[index].x * color_w)
-                cy_color = int(landmarks[index].y * color_h)
-                
-                # Convert to depth frame coordinates (in case they're different)
-                cx_depth = int(landmarks[index].x * depth_w)
-                cy_depth = int(landmarks[index].y * depth_h)
-                
-                # Clamp coordinates to valid depth frame bounds
-                cx_depth = max(0, min(cx_depth, depth_w - 1))
-                cy_depth = max(0, min(cy_depth, depth_h - 1))
-                
-                # Get depth value using depth frame coordinates
-                try:
-                    depth_val = depth_frame.get_distance(cx_depth, cy_depth)
-                    if depth_val == 0:  # No depth data at this point
-                        depth_val = 1.0  # Default depth in meters
-                except:
-                    depth_val = 1.0  # Fallback depth
-                
-                # Return using color frame coordinates for display consistency
-                return [cx_color, cy_color, depth_val]
+            # Extract TRUE 3D landmarks using camera intrinsics (all coordinates in meters)
+            # Include all landmarks needed by exercise functions: left/right shoulder, elbow, wrist, hip, knee, ankle
+            landmark_indices = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
+            if camera_intrinsics:
+                landmarks_3d = get_multiple_3d_landmarks(landmarks, landmark_indices, color_w, color_h, depth_w, depth_h, depth_frame, camera_intrinsics)
+                coordinate_system = "TRUE 3D (meters)"
+            else:
+                landmarks_3d = get_multiple_3d_landmarks(landmarks, landmark_indices, color_w, color_h, depth_w, depth_h, depth_frame)
+                coordinate_system = "HYBRID (pixels+depth)"
 
-            right_shoulder = get_3d_landmark(12)
-            right_elbow = get_3d_landmark(14)
-            right_wrist = get_3d_landmark(16)
-            right_hip = get_3d_landmark(24)
-            right_knee = get_3d_landmark(26)
+            feedback, form_score, is_good_form, calculated_angles = selected_exercise_func(landmarks_3d)
 
-            elbow_angle = calculate_angle(right_shoulder, right_elbow, right_wrist, use_2d=False)  # True 3D
-            hip_angle = calculate_angle(right_shoulder, right_hip, right_knee, use_2d=False)      # True 3D
-            shoulder_angle = calculate_angle(right_hip, right_shoulder, right_elbow, use_2d=False) # True 3D
+            print(" | ".join(f"{key}: {value:.2f}" for key, value in calculated_angles.items()))
 
-            print(f"3D Angles - Elbow: {elbow_angle:.1f}°, Hip: {hip_angle:.1f}°, Shoulder: {shoulder_angle:.1f}°")
-
-            # Evaluate form and get feedback (using 3D calculated angles)
-            feedback, form_score, is_good_form = evaluate_bicep_curl({
-                "elbow_angle": elbow_angle,
-                "shoulder_angle": shoulder_angle,
-                "hip_angle": hip_angle
-            })
-            
             # Count reps based on elbow angle, wrist movement, and form
             rep_counted, current_phase, total_reps, transition_state, is_form_good_global = rep_counter.evaluate_rep(
-                elbow_angle, right_wrist[1], is_good_form  # Pass wrist Y coordinate
+                landmarks_3d, calculated_angles, is_good_form 
             )
             
             # Show rep count notification if a rep was just counted
             if rep_counted:
                 print(f"🎉 REP COMPLETED! Total reps: {total_reps}")
 
-            # Add angle information to info text when pose is detected
-            angle_info = [
-                f"Elbow: {elbow_angle:.1f}°",
-                f"Hip: {hip_angle:.1f}°", 
-                f"Shoulder: {shoulder_angle:.1f}°"
-            ]
+            angle_info = [f"{name}: {value:.1f}°" for name, value in calculated_angles.items()]
         else:
             angle_info = ["No pose detected"]
             feedback = "No pose detected"
@@ -249,10 +172,12 @@ try:
         depth_with_landmarks = cv2.cvtColor(annotated_depth, cv2.COLOR_RGB2BGR)
 
         # Add depth information display text to both frames
+        coord_type = "TRUE 3D" if camera_intrinsics else "HYBRID"
         info_text = [
             f"Preset: {DEPTH_PRESETS[current_preset]['name']}",
             f"Center Distance: {center_distance:.3f}m",
-            f"Data Quality: {data_quality:.1%}"
+            f"Data Quality: {data_quality:.1%}",
+            f"Coordinates: {coord_type}"
         ]
         
         # Add basic info to color frame
@@ -274,25 +199,29 @@ try:
         # Combine both videos side by side
         video_combined = np.hstack((display_frame, depth_with_landmarks))
         
-        # Create a feedback panel (same width as combined video, height 200px)
+        # Create a feedback panel (same width as combined video, height 300px)
         panel_width = video_combined.shape[1]  # Same width as video
-        panel_height = 200  # Fixed height at bottom
+        panel_height = 300  # Increased height for better readability
         feedback_panel = np.ones((panel_height, panel_width, 3), dtype=np.uint8) * 255  # white background
 
         # Add feedback content if pose detected
         if detection_result.pose_landmarks:
+            # Exercise name at the top
+            cv2.putText(feedback_panel, f"Exercise: {selected_exercise_name}", (10, 35),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.9, (50, 50, 200), 3)
+            
             # Left side: Rep counter and form score
-            cv2.putText(feedback_panel, f"REPS: {total_reps}", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 100, 0), 3)
-            cv2.putText(feedback_panel, f"Phase: {rep_counter.get_phase_description()}", (10, 60),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 100), 2)
-            cv2.putText(feedback_panel, f"Form Score: {form_score:.1%}", (10, 85),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 150, 0) if is_good_form else (0, 0, 150), 2)
+            cv2.putText(feedback_panel, f"REPS: {total_reps}", (10, 75),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.3, (0, 100, 0), 4)
+            cv2.putText(feedback_panel, f"Phase: {rep_counter.get_phase_description()}", (10, 115),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 100, 100), 2)
+            cv2.putText(feedback_panel, f"Form Score: {form_score:.1%}", (10, 150),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 150, 0) if is_good_form else (0, 0, 150), 2)
             
             # Add movement form status
             form_status = rep_counter.get_form_status()
             form_color = (0, 150, 0) if form_status == "CORRECT" else (0, 0, 200)
-            cv2.putText(feedback_panel, f"Movement: {form_status}", (10, 110),
+            cv2.putText(feedback_panel, f"Movement: {form_status}", (10, 135),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, form_color, 2)
             
             # Middle section: 3D Analysis
@@ -332,7 +261,8 @@ try:
         final_combined = np.vstack((video_combined, feedback_panel))
         
         # Show result with color, depth, and feedback
-        cv2.imshow("3D Pose Analysis: Color + Depth + Feedback", final_combined)
+        window_title = f"3D Pose Analysis: {selected_exercise_name}"
+        cv2.imshow(window_title, final_combined)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
@@ -342,7 +272,7 @@ try:
             print("Rep counter reset!")
         
         # Check if window was closed
-        if cv2.getWindowProperty("3D Pose Analysis: Color + Depth + Feedback", cv2.WND_PROP_VISIBLE) < 1:
+        if cv2.getWindowProperty(window_title, cv2.WND_PROP_VISIBLE) < 1:
             break
             break
 
